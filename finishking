@@ -1,0 +1,625 @@
+--========================================================--
+-- CRYSTAL DEPTHS AUTO MINE + AUTO HOP (C1 → C2 → HOP)
+-- KECEPATAN SANTAI (MINE_PACE ditambahkan)
+--========================================================--
+
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local TeleportService  = game:GetService("TeleportService")
+local HttpService      = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+
+local Player = Players.LocalPlayer
+
+--========================================================--
+-- KONFIGURASI
+--========================================================--
+
+local CrystalDepths1Position = Vector3.new(5614, -904, 15345)
+local CrystalDepths2Position = Vector3.new(894, 89, -10195)
+
+local ScanDelay          = 1
+local MaxCrystalDistance = 250
+local PromptDelay        = 0.5
+local TeleportDelay      = 3
+
+-- Mining behavior (mirip versi lama)
+local AREA_EMPTY_STREAK  = 5     -- gagal scan berturut-turut sebelum pindah area
+local AREA_EMPTY_WAIT    = 1     -- jeda antar gagal scan
+local AREA_GRACE_TIMEOUT = 5     -- tunggu crystal pertama muncul setelah teleport
+local MINE_PACE          = 1.2   -- jeda santai antar mine yang berhasil (detik)
+
+-- Auto Hop
+local HopDelay           = 5
+local HOP_MAX_ATTEMPTS   = 8
+local HOP_FAIL_TIMEOUT   = 20
+
+local PLACE_ID    = game.PlaceId
+local CURRENT_JOB = game.JobId
+
+--========================================================--
+-- STATE
+--========================================================--
+
+local mineCount   = 0
+local hopAttempts = 0
+local hopMax      = HOP_MAX_ATTEMPTS
+local hopRunning  = false
+local currentArea = 1
+
+--========================================================--
+-- HTTP REQUEST
+--========================================================--
+
+local httpRequest =
+    (syn and syn.request)
+    or http_request
+    or request
+    or (http and http.request)
+
+--========================================================--
+-- UTIL
+--========================================================--
+
+local function teleportTo(position)
+    local character = Player.Character
+    if not character then return false end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    root.CFrame = CFrame.new(position)
+    return true
+end
+
+local function isAlive()
+    local character = Player.Character
+    if not character then return false end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    return character:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+--========================================================--
+-- CRYSTAL PROMPT DETECTION
+--========================================================--
+
+local BlacklistWords = {
+    "npc", "craft", "table", "shop",
+    "sell", "buy", "talk", "dialog",
+    "examine", "miner", "minecart",
+    "miningtable", "crafting",
+}
+
+local function containsWord(text, word)
+    return string.find(text, word, 1, true) ~= nil
+end
+
+local function isCrystalPrompt(prompt)
+    if not prompt:IsA("ProximityPrompt") then return false end
+
+    local model = prompt:FindFirstAncestorOfClass("Model")
+    if model and model:FindFirstChildOfClass("Humanoid") then
+        return false
+    end
+
+    local action = string.lower(prompt.ActionText or "")
+    local object = string.lower(prompt.ObjectText or "")
+
+    for _, word in ipairs(BlacklistWords) do
+        if containsWord(action, word) or containsWord(object, word) then
+            return false
+        end
+    end
+
+    local part = prompt:FindFirstAncestorWhichIsA("BasePart")
+    local partName = part and string.lower(part.Name) or ""
+
+    return containsWord(action, "crystal")
+        or containsWord(object, "crystal")
+        or containsWord(partName, "crystal")
+end
+
+local function getPromptPosition(prompt)
+    local parent = prompt.Parent
+    if parent:IsA("BasePart") then return parent.Position end
+    if parent:IsA("Attachment") then return parent.WorldPosition end
+    local part = prompt:FindFirstAncestorWhichIsA("BasePart")
+    if part then return part.Position end
+    return nil
+end
+
+local function findCrystal()
+    local character = Player.Character
+    if not character then return nil end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local closest, closestDistance = nil, math.huge
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt")
+            and obj.Enabled
+            and isCrystalPrompt(obj) then
+
+            local position = getPromptPosition(obj)
+            if position then
+                local distance = (root.Position - position).Magnitude
+                if distance < closestDistance
+                    and distance <= MaxCrystalDistance then
+                    closestDistance = distance
+                    closest = obj
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function firePrompt(prompt)
+    if typeof(fireproximityprompt) == "function" then
+        pcall(function() fireproximityprompt(prompt) end)
+        return true
+    end
+    local ok = pcall(function()
+        local oldHold = prompt.HoldDuration
+        prompt.HoldDuration = 0
+        prompt:InputHoldBegin()
+        task.wait(0.05)
+        prompt:InputHoldEnd()
+        prompt.HoldDuration = oldHold
+    end)
+    return ok
+end
+
+--========================================================--
+-- SERVER HOP
+--========================================================--
+
+local hopCandidates = {}
+local doneCalled    = false
+local failedConn
+
+local function getServers()
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"):format(PLACE_ID)
+
+    local ok, body = pcall(function()
+        if httpRequest then
+            return httpRequest({ Url = url, Method = "GET" }).Body
+        end
+        return game:HttpGet(url)
+    end)
+
+    if not ok or not body then return nil end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+
+    if not okDecode or not decoded then return nil end
+    if decoded.errors then return nil end
+    return decoded.data
+end
+
+local function finishHop()
+    doneCalled = true
+    hopRunning = false
+    if failedConn then
+        failedConn:Disconnect()
+        failedConn = nil
+    end
+end
+
+local tryNextHop
+tryNextHop = function()
+    if doneCalled then return end
+
+    if hopAttempts >= HOP_MAX_ATTEMPTS then
+        warn("[AutoHop] Batas percobaan tercapai")
+        finishHop()
+        return
+    end
+
+    local target = table.remove(hopCandidates)
+    if not target then
+        warn("[AutoHop] Tidak ada server lain")
+        finishHop()
+        return
+    end
+
+    hopAttempts = hopAttempts + 1
+    local myAttempt = hopAttempts
+    updateStatus()
+
+    print(("[AutoHop] Percobaan %d/%d -> %s"):format(myAttempt, HOP_MAX_ATTEMPTS, target))
+
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(PLACE_ID, target, Player)
+    end)
+
+    if not ok then
+        warn("[AutoHop] Teleport error:", err)
+        task.wait(1)
+        return tryNextHop()
+    end
+
+    task.delay(HOP_FAIL_TIMEOUT, function()
+        if doneCalled or hopAttempts ~= myAttempt then return end
+        warn(("[AutoHop] Timeout %ds, coba server lain..."):format(HOP_FAIL_TIMEOUT))
+        tryNextHop()
+    end)
+end
+
+local function serverHop()
+    if hopRunning then return end
+    hopRunning    = true
+    hopAttempts   = 0
+    doneCalled    = false
+    hopCandidates = {}
+    updateStatus()
+
+    local servers = getServers()
+    if not servers then finishHop(); return end
+
+    for _, server in ipairs(servers) do
+        if server.id ~= CURRENT_JOB
+            and server.playing < server.maxPlayers - 1 then
+            table.insert(hopCandidates, server.id)
+        end
+    end
+
+    if #hopCandidates == 0 then
+        warn("[AutoHop] Tidak ada server lain")
+        finishHop()
+        return
+    end
+
+    for i = #hopCandidates, 2, -1 do
+        local j = math.random(1, i)
+        hopCandidates[i], hopCandidates[j] = hopCandidates[j], hopCandidates[i]
+    end
+
+    failedConn = TeleportService.TeleportInitFailed:Connect(function(player)
+        if player ~= Player or doneCalled then return end
+        task.wait(1)
+        tryNextHop()
+    end)
+
+    tryNextHop()
+end
+
+--========================================================--
+-- UI
+--========================================================--
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CrystalDepthsAutoMine"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = Player:WaitForChild("PlayerGui")
+
+local Frame = Instance.new("Frame")
+Frame.Size = UDim2.new(0, 220, 0, 135)
+Frame.Position = UDim2.new(0, 20, 0.5, 0)
+Frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+Frame.Active = true
+Frame.Parent = ScreenGui
+
+local FrameCorner = Instance.new("UICorner")
+FrameCorner.CornerRadius = UDim.new(0, 10)
+FrameCorner.Parent = Frame
+
+-- Drag
+local dragging, dragStart, startPos
+Frame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = Frame.Position
+    end
+end)
+Frame.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        Frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Title
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 30)
+Title.BackgroundTransparency = 1
+Title.Text = "CRYSTAL DEPTHS"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 15
+Title.Font = Enum.Font.GothamBold
+Title.Parent = Frame
+
+-- Status line
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(1, -20, 0, 20)
+StatusLabel.Position = UDim2.new(0, 10, 0, 30)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "HOP: 0/8  |  MINE: 0  |  AREA: CD1"
+StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+StatusLabel.TextSize = 12
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.Parent = Frame
+
+-- Info bar
+local InfoBar = Instance.new("TextButton")
+InfoBar.Size = UDim2.new(1, -20, 0, 45)
+InfoBar.Position = UDim2.new(0, 10, 0, 58)
+InfoBar.BackgroundColor3 = Color3.fromRGB(40, 150, 70)
+InfoBar.Text = "MINING CD1..."
+InfoBar.TextColor3 = Color3.fromRGB(255, 255, 255)
+InfoBar.TextSize = 15
+InfoBar.Font = Enum.Font.GothamBold
+InfoBar.AutoButtonColor = false
+InfoBar.Parent = Frame
+
+local InfoCorner = Instance.new("UICorner")
+InfoCorner.CornerRadius = UDim.new(0, 8)
+InfoCorner.Parent = InfoBar
+
+-- Footer
+local Footer = Instance.new("TextLabel")
+Footer.Size = UDim2.new(1, -20, 0, 18)
+Footer.Position = UDim2.new(0, 10, 0, 108)
+Footer.BackgroundTransparency = 1
+Footer.Text = "auto-run • C1 → C2 → hop"
+Footer.TextColor3 = Color3.fromRGB(140, 140, 140)
+Footer.TextSize = 11
+Footer.Font = Enum.Font.Gotham
+Footer.Parent = Frame
+
+--========================================================--
+-- UPDATE UI
+--========================================================--
+
+local areaName = { "CD1", "CD2" }
+
+function updateStatus()
+    StatusLabel.Text = ("HOP: %d/%d  |  MINE: %d  |  AREA: %s")
+        :format(hopAttempts, hopMax, mineCount, areaName[currentArea] or "?")
+end
+
+local function setStatus(text, color)
+    InfoBar.Text = text
+    InfoBar.BackgroundColor3 = color or Color3.fromRGB(40, 150, 70)
+end
+
+--========================================================--
+-- POPUP
+--========================================================--
+
+local function showPopup(message, color)
+    local existing = ScreenGui:FindFirstChild("PopupNotif")
+    if existing then existing:Destroy() end
+
+    local popup = Instance.new("TextLabel")
+    popup.Name = "PopupNotif"
+    popup.Size = UDim2.new(0, 280, 0, 45)
+    popup.Position = UDim2.new(0.5, -140, 0.35, 0)
+    popup.BackgroundColor3 = color or Color3.fromRGB(180, 40, 40)
+    popup.BackgroundTransparency = 0.1
+    popup.TextColor3 = Color3.fromRGB(255, 255, 255)
+    popup.Text = message
+    popup.TextSize = 15
+    popup.Font = Enum.Font.GothamBold
+    popup.ZIndex = 10
+    popup.Parent = ScreenGui
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 8)
+    c.Parent = popup
+
+    task.delay(3, function()
+        if popup and popup.Parent then popup:Destroy() end
+    end)
+end
+
+--========================================================--
+-- [AUTO EQUIP] SETUP PICKAXE
+--========================================================--
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local plr = Players.LocalPlayer
+
+local PICKAXE_ID = 20220
+local HOTBAR_SLOT = 2
+local CATEGORY = "Gears"
+
+local Replion = require(RS.Packages.Replion)
+local Util = require(RS.Shared.PlayerStatsUtility)
+local data = Replion.Client:WaitReplion("Data")
+
+local net = RS.Packages._Index["sleitnick_net@0.2.0"].net
+local function getRemote(label)
+    local children = net:GetChildren()
+    for i, child in ipairs(children) do
+        if child.Name == label then
+            local inside = child:FindFirstChildOfClass("RemoteEvent") or child:FindFirstChildOfClass("RemoteFunction")
+            if inside then return inside end
+            local nxt = children[i+1]
+            if nxt and (nxt:IsA("RemoteEvent") or nxt:IsA("RemoteFunction")) then return nxt end
+        end
+    end
+    return nil
+end
+
+local equipItemRemote = getRemote("RE/EquipItem")
+local equipHotbarRemote = getRemote("RE/EquipToolFromHotbar")
+
+local function getPickaxe()
+    return Util:GetItemFromInventory(data, function(item)
+        return item.Id == PICKAXE_ID
+    end, CATEGORY == "Gears" and "Gears" or "Items") or Util:GetItemFromInventory(data, function(item)
+        return item.Id == PICKAXE_ID
+    end, "Items")
+end
+
+local busy = false
+local function equipPickaxe()
+    if busy then return end
+    local item = getPickaxe()
+    if not item then return end
+    if data:Get("EquippedId") == item.UUID then return end -- sudah dipegang
+
+    busy = true
+    if equipItemRemote then
+        equipItemRemote:FireServer(item.UUID, CATEGORY)
+        task.wait(0.3)
+    end
+    if equipHotbarRemote then
+        equipHotbarRemote:FireServer(HOTBAR_SLOT)
+        task.wait(0.5)
+    end
+    busy = false
+end
+
+-- equip saat script jalan dan setiap respawn
+task.spawn(equipPickaxe)
+plr.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    equipPickaxe()
+end)
+
+--========================================================--
+-- MINE SATU CRYSTAL
+--========================================================--
+
+local function mineOneCrystal()
+    if not isAlive() then return false end
+
+    local prompt = findCrystal()
+    if not prompt then return false end
+
+    local position = getPromptPosition(prompt)
+    if not position then return false end
+
+    local character = Player.Character
+    if not character then return false end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    local fromRoot = root.Position - position
+    fromRoot = Vector3.new(fromRoot.X, 0, fromRoot.Z)
+    if fromRoot.Magnitude < 0.1 then
+        fromRoot = Vector3.new(0, 0, -1)
+    end
+    fromRoot = fromRoot.Unit * 4
+
+    root.CFrame = CFrame.new(position + fromRoot + Vector3.new(0, 3, 0))
+    task.wait(PromptDelay)
+
+    if not isAlive() then return false end
+
+    if firePrompt(prompt) then
+        mineCount = mineCount + 1
+        updateStatus()
+        return true
+    end
+    return false
+end
+
+--========================================================--
+-- PROSES SATU AREA (mirip versi lama, sekarang pakai MINE_PACE)
+--========================================================--
+
+local function processArea(areaIndex, position)
+    currentArea = areaIndex
+    updateStatus()
+    setStatus(("MINING %s..."):format(areaName[areaIndex]), Color3.fromRGB(40, 150, 70))
+
+    if position then
+        if not teleportTo(position) then
+            warn("[Mine] Gagal teleport ke " .. areaName[areaIndex])
+            return
+        end
+        task.wait(TeleportDelay)
+    end
+
+    -- Grace period: tunggu crystal pertama muncul (maks AREA_GRACE_TIMEOUT detik)
+    local graceStart = tick()
+    while tick() - graceStart < AREA_GRACE_TIMEOUT do
+        if findCrystal() then
+            break
+        end
+        task.wait(0.3)
+    end
+
+    -- Mining loop: mine sampai crystal benar-benar habis
+    local failStreak = 0
+    while true do
+        if not isAlive() then
+            task.wait(1)
+        else
+            local ok = mineOneCrystal()
+            if ok then
+                failStreak = 0
+                task.wait(MINE_PACE)   -- <<< jeda santai antar mine yang berhasil
+            else
+                failStreak = failStreak + 1
+                if failStreak >= AREA_EMPTY_STREAK then
+                    break
+                end
+                task.wait(AREA_EMPTY_WAIT)
+            end
+        end
+    end
+
+    print(("[Mine] %s selesai. Total mine: %d"):format(areaName[areaIndex], mineCount))
+end
+
+--========================================================--
+-- MAIN FLOW: C1 → C2 → HOP
+--========================================================--
+
+local function mainLoop()
+    while true do
+        processArea(1, CrystalDepths1Position)
+        processArea(2, CrystalDepths2Position)
+
+        setStatus("HOPPING SERVER...", Color3.fromRGB(180, 100, 40))
+        showPopup(("Semua area habis, hop dalam %ds..."):format(HopDelay),
+            Color3.fromRGB(180, 100, 40))
+        task.wait(HopDelay)
+
+        serverHop()
+
+        local waited = 0
+        while hopRunning and waited < 30 do
+            task.wait(1)
+            waited = waited + 1
+        end
+
+        task.wait(2)
+    end
+end
+
+--========================================================--
+-- START
+--========================================================--
+
+InfoBar.MouseButton1Click:Connect(function()
+    if hopRunning then return end
+    showPopup("Restart mining dari CD1...", Color3.fromRGB(40, 120, 200))
+    teleportTo(CrystalDepths1Position)
+end)
+
+task.spawn(function()
+    task.wait(1)
+    mainLoop()
+end)
+
+updateStatus()
+print("Crystal Depths Auto Mine (C1 → C2 → HOP) Loaded")
